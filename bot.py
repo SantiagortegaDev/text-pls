@@ -60,7 +60,7 @@ def check_user(user_id):
     d["last"] = now
     return "ok", 0
 
-def wait():
+def queue_wait():
     now = time.time()
     while times and times[0] < now - 60:
         times.pop(0)
@@ -182,7 +182,7 @@ class Retry(discord.ui.DynamicItem[discord.ui.Button], template=r"retry:(?P<msg>
         if ref is None:
             await interaction.response.send_message("Sorry, i don't see the original file", ephemeral=True)
             return
-        wait = wait()
+        wait = queue_wait()
         if wait == -1:
             await interaction.response.send_message("The bot is very busy right now, try again in a few minutes.", ephemeral=True)
             return
@@ -342,7 +342,7 @@ async def on_message(message):
           return
       if estatus == "ban":
           return
-      wait = wait()
+      wait = queue_wait()
       if wait == -1:
           await message.reply("The bot is very busy right now, try again in a few minutes.", mention_author=False, silent=True)
           return
