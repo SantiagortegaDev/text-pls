@@ -1,0 +1,3 @@
+discord
+groq
+python-dotenv
