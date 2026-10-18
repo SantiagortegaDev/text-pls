@@ -24,7 +24,7 @@ just a discord bot to get the text from a image, pdf, audio, etc
 > 
 > Img limit: discord's file limit
 > 
-> Pdf limit: 20 max (you can change it in the script but i can be slow)
+> Pdf limit: 20 pages max (you can change it in the script but i can be slow)
 
 ## Quick start
 1. Add the bot to a server (click the image or the link)
