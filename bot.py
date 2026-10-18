@@ -12,6 +12,8 @@ from discord.ext import tasks
 import asyncio
 import requests
 from discord import components as c
+import base64
+import pymupdf
 
 load_dotenv()
 
@@ -115,6 +117,7 @@ async def img2text(url):
           "content": [
             {
               "type": "text",
+              #the prompt is made with ai for another ai xd
               "text": """You are an OCR engine. Your only job is to transcribe the text visible in the image.
 
 Rules:
@@ -125,7 +128,7 @@ Rules:
 - For tables, write each row on its own line and separate the cells with " | ".
 - Do not use Markdown, code blocks, bold, bullet points or any formatting that is not in the image.
 - If a word or part is unreadable, write [illegible] in its place. Never guess or invent text.
-- If the image contains no text at all, output exactly: [NO_TEXT]"""
+- If the image contains no text at all, output exactly: [NO_TEXT]. If there is any text, never write [NO_TEXT]."""
             },
             {
               "type": "image_url",
@@ -136,21 +139,30 @@ Rules:
           ]
         }
       ],
-      "model": "moonshotai/kimi-k3",
-      "max_tokens": 16384,
+      "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+      "max_tokens": 4096,
       "seed": 0,
       "stream": stream,
-      "temperature": 1,
-      "reasoning_effort": "low"
+      "temperature": 0,
+      "chat_template_kwargs": {"enable_thinking": False}
     }
     
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
-        async with s.post(invoke_url, headers=headers, json=payload) as r:
-            data = await r.json()
-            if r.status != 200:
-                raise Exception(f"NVIDIA {r.status}: {data}")
-    return data["choices"][0]["message"]["content"]
-
+     for intento in range(4):
+         try:
+             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
+                 async with s.post(invoke_url, headers=headers, json=payload) as r:
+                     body = await r.text()
+         except asyncio.TimeoutError:
+             print("NVIDIA timeout, intento", intento + 1)
+             continue
+         if r.status in (429, 503):
+             await asyncio.sleep(2 + intento * 3)
+             continue
+         if r.status != 200:
+             raise Exception(f"NVIDIA {r.status}: {body}")
+         return json.loads(body)["choices"][0]["message"]["content"]
+     raise Exception("NVIDIA failed after 4 tries")
 async def audio2text(url):
     client = AsyncGroq(api_key=os.environ["GROQAPIKEY"])
     transcription = await client.audio.transcriptions.create(
@@ -480,36 +492,254 @@ async def run_images(images, msg_id, edit, only=None):
     await edit(build_img_view(images, msg_id, results))
 
     for n, i in enumerate(todo):
-        if n > 0:
-            w = queue_wait()
-            if w == -1:
-                results[i] = ("busy", "")
-                save_text(msg_id, i, "[BUSY]")
-                await edit(build_img_view(images, msg_id, results))
-                continue
-            if w > 0:
-                await asyncio.sleep(w)
-        if images[i]["url"].split("?")[0].lower().endswith(".gif"):
-            results[i] = ("gif", "")
-            save_text(msg_id, i, "[GIF]")
-            await edit(build_img_view(images, msg_id, results))
-            continue
+     await edit(build_img_view(images, msg_id, results))
 
-        try:
-            text = (await img2text(images[i]["url"]) or "").strip()
-            if text == "":
-                raise Exception("empty response")
-            if text == "[NO_TEXT]":
-                results[i] = ("notext", "")
-            else:
-                results[i] = ("ok", text)
-            save_text(msg_id, i, text)
-        except Exception as e:
-            print("ERROR nvidia:", repr(e))
-            results[i] = ("err", "")
-            save_text(msg_id, i, "[ERROR]")
-        await edit(build_img_view(images, msg_id, results))
+     sem = asyncio.Semaphore(3)
+ 
+     async def do(i):
+         async with sem:
+             if images[i]["url"].split("?")[0].lower().endswith(".gif"):
+                 results[i] = ("gif", "")
+                 save_text(msg_id, i, "[GIF]")
+             else:
+                 try:
+                     text = (await img2text(images[i]["url"]) or "").strip()
+                     if text == "":
+                         raise Exception("empty response")
+                     if text == "[NO_TEXT]":
+                         results[i] = ("notext", "")
+                     else:
+                         results[i] = ("ok", text)
+                     save_text(msg_id, i, text)
+                 except Exception as e:
+                     print("ERROR nvidia:", repr(e))
+                     results[i] = ("err", "")
+                     save_text(msg_id, i, "[ERROR]")
+             await edit(build_img_view(images, msg_id, results))
 
+     await asyncio.gather(*[do(i) for i in todo])
+     await edit(build_img_view(images, msg_id, results))
+pages_max = 20
+preview = 1500
+viewing = {}
+
+def count_pages(data):
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    if doc.needs_pass:
+        doc.close()
+        raise Exception("pdf has password")
+    n = doc.page_count
+    doc.close()
+    return n
+
+def render_page(data, i):
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    page = doc[i]
+    zoom = min(150 / 72, 2200 / max(page.rect.width, page.rect.height))
+    png = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom)).tobytes("png")
+    doc.close()
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+async def download_pdf(url):
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
+        async with s.get(url) as r:
+            if r.status != 200:
+                raise Exception(f"download {r.status}")
+            return await r.read()
+
+async def find_pdfs(bot, channel_id, message_id):
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(channel_id)
+    message = await channel.fetch_message(message_id)
+    results = []
+    for fuente in [message] + list(message.message_snapshots):
+        for a in fuente.attachments:
+            if (a.content_type or "").startswith("application/pdf") or a.filename.lower().endswith(".pdf"):
+                results.append({"url": a.url, "filename": a.filename, "size": a.size})
+    return results
+
+def notice(text):
+    a = discord.ui.LayoutView(timeout=None)
+    a.add_item(discord.ui.Container(discord.ui.TextDisplay(text)))
+    return a
+
+def read_meta(msg_id):
+    t = read_text(msg_id, "meta")
+    if t is None:
+        return None
+    shown, total, name = t.split("|", 2)
+    return int(shown), int(total), name
+
+def load_pdf_results(msg_id, n):
+    try:
+        with open("transcriptions.json", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    results = []
+    for i in range(n):
+        a = data.get(f"{msg_id}:{i}")
+        t = a["texto"] if isinstance(a, dict) else a
+        if t is None:
+            results.append(None)
+        elif t == "[ERROR]":
+            results.append(("err", ""))
+        elif t == "[NO_TEXT]":
+            results.append(("notext", ""))
+        elif t == "[BUSY]":
+            results.append(("busy", ""))
+        else:
+            results.append(("ok", t))
+    return results
+
+class PdfNav(discord.ui.DynamicItem[discord.ui.Button], template=r"pdfnav:(?P<msg>\d+):(?P<i>\d+):(?P<d>[pn])"):
+    def __init__(self, msg_id, i, d, disabled=False):
+        i = max(0, i)
+        label = "◀" if d == "p" else "▶"
+        super().__init__(discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"pdfnav:{msg_id}:{i}:{d}", disabled=disabled))
+        self.msg_id = msg_id
+        self.i = i
+        self.d = d
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["msg"]), int(match["i"]), match["d"])
+
+    async def callback(self, interaction):
+        meta = read_meta(self.msg_id)
+        if meta is None:
+            await interaction.response.send_message("Sorry, this document expired.", ephemeral=True)
+            return
+        shown, total, name = meta
+        page = min(self.i, shown - 1)
+        if self.msg_id in viewing:
+            viewing[self.msg_id] = page
+        results = load_pdf_results(self.msg_id, shown)
+        view = build_pdf_view(self.msg_id, name, shown, total, results, page)
+        await interaction.response.edit_message(view=view)
+
+class RetryPdf(discord.ui.DynamicItem[discord.ui.Button], template=r"retrypdf:(?P<msg>\d+):(?P<i>\d+)"):
+    def __init__(self, msg_id, i):
+        super().__init__(discord.ui.Button(label="Retry", style=discord.ButtonStyle.secondary, custom_id=f"retrypdf:{msg_id}:{i}"))
+        self.msg_id = msg_id
+        self.i = i
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["msg"]), int(match["i"]))
+
+    async def callback(self, interaction):
+        original = await prepare_retry(interaction)
+        if original is None:
+            return
+        pdfs = await find_pdfs(bot, original.channel.id, original.id)
+        async def edit(v):
+            await interaction.edit_original_response(view=v, allowed_mentions=discord.AllowedMentions.none())
+        if not pdfs:
+            await edit(notice("> Sorry, i can't find the PDF."))
+            return
+        await run_pdf(pdfs[0], self.msg_id, edit, only=self.i)
+
+def build_pdf_view(msg_id, name, shown, total, results, page, status=None):
+    view = discord.ui.LayoutView(timeout=None)
+    container = discord.ui.Container()
+    container.add_item(discord.ui.TextDisplay(f"## {name[:60]}"))
+    container.add_item(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+    r = results[page]
+    if r is None:
+        body = "-# Loading..."
+    elif r[0] == "busy":
+        body = "> The bot is very busy, press Retry in a moment."
+    elif r[0] == "err":
+        body = "> Sorry, the scan failed. Press Retry."
+    elif r[0] == "notext":
+        body = "> No text found in this page."
+    else:
+        body = quote(r[1][:preview])
+        if len(r[1]) > preview:
+            body += "..."
+    container.add_item(discord.ui.TextDisplay(body))
+    if total > shown:
+        container.add_item(discord.ui.TextDisplay(f"-# Only the first {shown} of {total} pages are scanned."))
+    if status:
+        container.add_item(discord.ui.TextDisplay(status))
+
+    row = discord.ui.ActionRow()
+    row.add_item(PdfNav(msg_id, page - 1, "p", page == 0))
+    row.add_item(discord.ui.Button(label=f"{page + 1}/{shown}", style=discord.ButtonStyle.secondary, disabled=True))
+    row.add_item(PdfNav(msg_id, page + 1, "n", page >= shown - 1))
+    row.add_item(RetryPdf(msg_id, page))
+    if r is not None and r[0] == "ok":
+        row.add_item(Extend(msg_id, page))
+    container.add_item(row)
+    view.add_item(container)
+    return view
+
+async def run_pdf(pdf, msg_id, edit, only=None):
+    try:
+        if pdf["size"] > 20 * 1024 * 1024:
+            await edit(notice("> The PDF is too big, 20MB max."))
+            return
+        data = await download_pdf(pdf["url"])
+        total = await asyncio.to_thread(count_pages, data)
+        if total == 0:
+            raise Exception("pdf without pages")
+    except Exception as e:
+        print("ERROR pdf:", repr(e))
+        await edit(notice("> Sorry, i can't open this PDF."))
+        return
+
+    shown = min(total, pages_max)
+    name = pdf["filename"]
+    save_text(msg_id, "meta", f"{shown}|{total}|{name}")
+    if only is not None and only >= shown:
+        only = None
+    if only is None:
+        results = [None] * shown
+        todo = list(range(shown))
+        viewing[msg_id] = 0
+    else:
+        results = load_pdf_results(msg_id, shown)
+        results[only] = None
+        todo = [only]
+        viewing[msg_id] = only
+
+    def show(n):
+        status = None
+        if only is None and n < len(todo):
+            status = f"-# Scanning page {n + 1}/{shown}..."
+        return build_pdf_view(msg_id, name, shown, total, results, viewing.get(msg_id, 0), status)
+
+    try:
+        await edit(show(0))
+        for n, i in enumerate(todo):
+            if n > 0:
+                w = queue_wait()
+                if w == -1:
+                    results[i] = ("busy", "")
+                    save_text(msg_id, i, "[BUSY]")
+                    await edit(show(n + 1))
+                    continue
+                if w > 0:
+                    await asyncio.sleep(w)
+            try:
+                img = await asyncio.to_thread(render_page, data, i)
+                text = (await img2text(img) or "").strip()
+                if text == "":
+                    raise Exception("empty response")
+                if text == "[NO_TEXT]":
+                    results[i] = ("notext", "")
+                else:
+                    results[i] = ("ok", text)
+                save_text(msg_id, i, text)
+            except Exception as e:
+                print("ERROR nvidia pdf:", repr(e))
+                results[i] = ("err", "")
+                save_text(msg_id, i, "[ERROR]")
+            await edit(show(n + 1))
+    finally:
+        viewing.pop(msg_id, None)
 async def find_voice_messages(bot, channel_id, message_id, include_reply=False):
     channel = bot.get_channel(channel_id)
     if channel is None:
@@ -609,13 +839,21 @@ async def on_message(message):
       async def edit(v):
           await msg.edit(view=v, allowed_mentions=discord.AllowedMentions.none())
       await run_images(images[:5], msg.id, edit)
+     pdfs = await find_pdfs(bot, reply_msg.channel.id, reply_msg.id)
+     if pdfs:
+      msg = await start_job(message, reply_msg)
+      if msg is None:
+          return
+      async def edit(v):
+          await msg.edit(view=v, allowed_mentions=discord.AllowedMentions.none())
+      await run_pdf(pdfs[0], msg.id, edit)
 
      #await message.channel.send(
      #    f"{message.author.mention} respondió a {reply_msg.author.mention}: {reply_msg.content}"
      #)    
 
 async def setup_hook():
-    bot.add_dynamic_items(Extend, Retry, RetryImg)
+    bot.add_dynamic_items(Extend, Retry, RetryImg, PdfNav, RetryPdf)
     limpiar.start()
 
 bot.setup_hook = setup_hook
