@@ -21,7 +21,9 @@ just a discord bot to get the text from a image, pdf, audio, etc
 
 > [!NOTE]
 > Audio limit: 19.5MB max
+> 
 > Img limit: discord's file limit
+> 
 > Pdf limit: 20 max (you can change it in the script but i can be slow)
 
 ## Quick start
