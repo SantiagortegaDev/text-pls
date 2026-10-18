@@ -2,3 +2,4 @@ discord
 groq
 python-dotenv
 pymupdf
+requests
