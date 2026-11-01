@@ -41,5 +41,30 @@ just a discord bot to get the text from a image, pdf, audio, etc
 
 that's it! simple to use
 
+## Host it your self!
+1. **Clone the repo**
+```bash
+git clone https://github.com/SantiagortegaDev/text-pls.git
+cd text-pls
+```
+2. **Create a virtual enviroment in python**<br>(optional, only if you want)
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+3. **Create .env file**
+```bash
+cp .env.example .env
+nano .env
+```
+4. **Install dependencies**
+```bash
+pip install -r requirements.txt
+```
+5. **Run the best bot of discord**<br>(just kidding)
+```bash
+python3 bot.py
+```
+
 ## IA?
 yes, for some funtions like the pdf i paste code from claude and not for the design, the command, the apis, etc
